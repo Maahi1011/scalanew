@@ -1,0 +1,146 @@
+spark-config {
+}
+metastore {
+  type: "delta"
+  vacuum: 24
+  table: "`en_dlake_dev`.work_cnfz.cnfz_metastore"
+}
+extended: true
+
+
+source {
+  project.name: "PRESCRIPTION_CNFZ-PRESCRIPTION_BASE-CNFZ"
+  mapping: [
+    {
+      "index": 1
+      "id": "prescription"
+	  "source": "s3"
+      "location": "`en_dlake_dev`.entity_rawz.prescription"
+      "format": "delta"
+      "options": {"readChangeFeed": "true"}
+      "stream": true
+      "join": "prescription"
+	  "doTransform": "com.hs.bdes.prescription.PrescriptionEntityTransform"
+      "columns" : [
+             "KAFKA_TS",
+             "KAFKA_VALUE as kafka_value",
+             "KAFKA_KEY",
+             "get_json_object(kafka_value, '$.payload.doseType.code') as dose_type_desc",
+             "get_json_object(kafka_value, '$.payload.externalPrescriptionNumber') as external_prescription_nbr",
+             "get_json_object(kafka_value, '$.payload.prescriptionNumber') as prescription_nbr",
+             "get_json_object(kafka_value, '$.payload.source.externalId') as source_system_external_id",
+             "get_json_object(kafka_value, '$.payload.ingestionDocument.resourceId') as ingestion_document_resource_id",
+             "get_json_object(kafka_value, '$.payload.labelPrescriptionNumber') as label_prescription_nbr",
+             "get_json_object(kafka_value, '$.payload.referral.resourceId') as referral_resource_id",
+             "get_json_object(kafka_value, '$.payload.relativeId') as relative_id",
+             "get_json_object(kafka_value, '$.payload.nrxPrescriptionId') as nrx_prescription_id",
+             "get_json_object(kafka_value, '$.payload.resourceId') as prescription_resource_id",
+             "get_json_object(kafka_value, '$.payload.source.originCode') as source_system_origin_cde",
+             "get_json_object(kafka_value, '$.payload.sourceIdentifier') as source_system_id",
+             "get_json_object(kafka_value, '$.payload.sourceDateTime') as source_system_insert_tms_txt",
+             "get_json_object(kafka_value, '$.payload.updatedDateTime') as source_system_last_update_tms_txt",
+             "get_json_object(kafka_value, '$.payload.referral.resourceId') as document_reference_resource_id",
+             "get_json_object(kafka_value, '$.payload.CurrentFillNumber') as current_fill_nbr",
+             "get_json_object(kafka_value, '$.payload.fillType') as fill_type_desc",
+             "get_json_object(kafka_value, '$.payload.renewedFromPrescription.resourceId') as from_prescription_renewal_id",
+             "get_json_object(kafka_value, '$.payload.renewedToPrescription.resourceId') as to_prescription_renewal_id",
+             "get_json_object(kafka_value, '$.payload.RxsCancelCode') as cancel_txt",
+             "get_json_object(kafka_value, '$.payload.tempRenewedFromPrescription.resourceId') as temporary_renewed_from_prescription_resource_id",
+             "get_json_object(kafka_value, '$.payload.transferredFromPrescription.prescription.resourceId') as transferred_from_prescription_resource_id",
+             "get_json_object(kafka_value, '$.payload.transferredToPrescription.prescription.resourceId') as transferred_to_prescription_resource_id",
+             "get_json_object(kafka_value, '$.payload.transferredFromPrescription.prescription.LabelPrescriptionNumber') as transferred_from_label_prescription_nbr",
+             "get_json_object(kafka_value, '$.payload.transferredToPrescription.prescription.LabelPrescriptionNumber') as transferred_to_label_prescription_nbr",
+             "get_json_object(kafka_value, '$.payload.expirationDate') as expiration_dte",
+             "get_json_object(kafka_value, '$.payload.receivedDate') as received_dte",
+             "get_json_object(kafka_value, '$.payload.writtenDate') as written_dte",
+             "get_json_object(kafka_value, '$.payload.refillReminderDate') as refill_reminder_dte",
+             "get_json_object(kafka_value, '$.payload.renewalReminderDate') as renewal_reminder_dte",
+             "get_json_object(kafka_value, '$.payload.reorderDate') as reorder_dte",
+             "get_json_object(kafka_value, '$.payload.fillsAllowedQuantity') as fills_allowed_quantity",
+             "get_json_object(kafka_value, '$.payload.forPatient.subGroup') as for_patient_subgroup",
+             "get_json_object(kafka_value, '$.payload.forPatient.membershipId') as member_agn_id_tmp",
+      ]
+    }
+  ]
+
+}
+
+target {
+  place: "s3"
+  options: {
+    location: "en_dlake_dev.work_cnfz.prescription_base"
+    streamCheckpointLocation: "s3://hs-bdes-dev-logs/claims/work/checkpoint4stream/prescription_base"
+    streamInterval: "AvailableNow"
+    format: "delta"
+    compression:"snappy"
+    mode: "overwrite"
+    stream: true
+  }
+  "cols-order": [
+  "prescription_id",
+  "automatically_refill_ind",
+  "automatically_renew_ind",
+  "dose_type_desc",
+  "external_prescription_nbr",
+  "prescription_nbr",
+  "source_system_external_id",
+  "ingestion_document_resource_id",
+  "label_prescription_nbr",
+  "referral_resource_id",
+  "relative_id",
+  "nrx_prescription_id",
+  "tenant_id",
+  "prescription_resource_id",
+  "renewal_ind",
+  "source_system_origin_cde",
+  "source_system_id",
+  "temporary_renewed_from_prescription_id",
+  "from_prescription_transfer_id",
+  "to_prescription_transfer_id",
+  "from_prescription_renewal_resource_id",
+  "to_prescription_renewal_resource_id",
+  "source_system_insert_tms",
+  "source_system_insert_tms_txt",
+  "source_system_insert_timezone_txt",
+  "document_reference_resource_id",
+  "current_fill_nbr",
+  "fill_type_desc",
+  "from_prescription_renewal_id",
+  "to_prescription_renewal_id",
+  "cancel_txt",
+  "temporary_renewed_from_prescription_resource_id",
+  "transferred_from_prescription_resource_id",
+  "transferred_to_prescription_resource_id",
+  "transferred_from_label_prescription_nbr",
+  "transferred_to_label_prescription_nbr",
+  "expiration_dte date",
+  "received_dte date",
+  "written_dte date",
+  "refill_reminder_dte date",
+  "renewal_reminder_dte date",
+  "reorder_dte date",
+  "data_lake_last_update_tms",
+  "source_system_last_update_tms",
+  "source_system_last_update_tms_txt",
+  "source_system_last_update_timezone_txt",
+  "void_ind",
+  "stop_cde",
+  "dod_deployed_ind",
+  "refill_remaining_qty integer",
+  "expiration_days_qty integer",
+  "fills_allowed_qty integer",
+  "carrier_operational_id",
+  "prescribed_items",
+  "prescriber",
+  "event",
+  "referral_documents",
+  "for_patient",
+  "previous_for_patient",
+  "status",
+  "receiving_pharmacy_store_key",
+  "fills",
+  "scheduled_fill",
+  "store_key",
+
+  ]
+}
