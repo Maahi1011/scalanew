@@ -1,0 +1,765 @@
+
+package com.esi.dpe.prescription
+import com.esi.dpe.utils.JsonUtils.getJSONValue
+import com.typesafe.config.Config
+import com.typesafe.scalalogging.LazyLogging
+import com.yotabites.config.ConfigParser.DPFConfig
+import com.yotabites.custom.HBaseTransform
+import org.apache.hadoop.hbase.client.Scan
+import org.apache.hadoop.hbase.spark.HBaseContext
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.hadoop.hbase.{CellUtil, TableName}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.{StructField, _}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+import org.json4s._
+import org.json4s.jackson.JsonMethods._
+import com.esi.dpe.utils.JsonUtils.{getJSONValue, _}
+import com.esi.dpe.utils.TimeZoneUtils._
+import com.esi.dpe.prescription.PrescriptionSchema._
+
+import scala.collection.JavaConverters._
+import scala.util.Try
+
+class PrescriptionEntityTransform extends HBaseTransform with LazyLogging with Serializable {
+  override def transform(config: DPFConfig, spark: SparkSession, hbaseCtx: HBaseContext, scan: Scan): DataFrame = {
+
+    val tableName = config.location
+    val cf = config.columnFamily
+    val jsonCol = "KAFKA_VALUE"
+
+    val directPreMap = config.custom.getJSONObject("prescription_mapping")
+
+    val prescriptionMapping = directPreMap.keySet.asScala.toList.map(x => (x, directPreMap.getString(x)))
+
+    scan.addColumn(cf.getBytes, jsonCol.getBytes)
+    val hbaseRdd = hbaseCtx.hbaseRDD(TableName.valueOf(tableName), scan)
+
+    val colsRdd: RDD[List[Any]] = hbaseRdd.map(x => {
+      val jsonStr = Bytes.toString(CellUtil.cloneValue(
+        x._2.getColumnLatestCell(cf.getBytes, jsonCol.getBytes)
+      ))
+
+      val jObj = Try {
+        parse(jsonStr)
+      }.getOrElse(null)
+
+      if (jObj == null) Nil else {
+
+        val jsonStringMap = prescriptionMapping.map(x => (x._1, getJSONValue[String](jObj, x._2)))
+
+        // source system last - ssl, ssi - source system insert
+        val ssl_update_timestamp = getTimeStamp(getJSONValue[String](jObj, "payload.updatedDateTime"))
+        val ssi_timestamp = getTimeStamp(getJSONValue[String](jObj, "payload.sourceDateTime"))
+        val dod_ind = getBool(getJSONValue[String](jObj, "payload.dodDeployedIndicator"))
+        val void_flag = getBoolConv(getJSONValue[String](jObj, "payload.rxsVoidFlag"))
+        val stop_flag = getJSONValue[String](jObj, "payload.rxsStopFlag")
+        val refill_ind = getJSONValue[Boolean](jObj, "payload.autoRefillIndicator")
+        val auto_ind  =  getJSONValue[Boolean](jObj, "payload.autoRenewIndicator")
+        val renewal_ind = getJSONValue[Boolean](jObj, "payload.renewalIndicator")
+
+        val tenantId = {
+          if (getJSONValue[BigInt](jObj, "payload.tenantId").eq(null)) ""
+          else getJSONValue[BigInt](jObj, "payload.tenantId").toString
+        }
+
+        val refillRemain = {
+          if (getJSONValue[BigInt](jObj, "payload.refillsRemaining").eq(null)) 0L
+          else getJSONValue[BigInt](jObj, "payload.refillsRemaining").toLong
+        }
+
+        val exp_qty = {
+          if (getJSONValue[BigInt](jObj, "payload.expirationDays").eq(null)) 0L
+          else getJSONValue[BigInt](jObj, "payload.expirationDays").toLong
+        }
+
+        try {
+          jsonStringMap.map(_._2) ::: List(ssi_timestamp, ssl_update_timestamp, dod_ind, void_flag, stop_flag, refill_ind, auto_ind, renewal_ind, tenantId, refillRemain, exp_qty) ::: List(getPrescribedItemList(jObj), getPrescriberList(jObj)) ::: List(getEventsList(jObj), getReferralDocsList(jObj)) ::: List(getForPatientList(jObj)) ::: List(getPrevForPatientList(jObj)) :::
+          List(getPrescStatusList(jObj)) ::: List(getRecvPhcyStoreList(jObj,"payload.")) ::: List(getFillList(jObj), getScheduledList(jObj)) ::: List(getStoreKeyList(jObj,"payload."))
+        }
+
+        catch {
+          case e: Exception => e.printStackTrace();
+            print(e)
+            sys.exit(1)
+            List()
+        }
+      }
+    })
+
+    val stringOne2OneCols = prescriptionMapping.map(_._1)
+    val selCols = (stringOne2OneCols :+
+      "source_system_insert_tms" :+
+      "source_system_last_update_tms" :+
+      "dod_deployed_ind" :+
+      "void_ind" :+
+      "stop_cde" :+
+      "automatically_refill_ind" :+
+      "automatically_renew_ind" :+
+      "renewal_ind" :+
+      "tenant_id" :+
+      "refill_remaining" :+
+      "expiration_qty" :+
+      "prescribed_items" :+
+      "prescriber"  :+
+      "event" :+
+      "referral_documents" :+
+      "for_patient_tmp" :+
+      "previous_for_patient" :+
+      "status" :+
+      "receiving_pharmacy_store_key" :+
+      "fills"  :+
+      "scheduled_fill" :+
+      "store_key"
+      )
+
+
+    val dfschema = StructType(stringOne2OneCols.map(x => StructField(x, StringType)) :+
+      StructField("source_system_insert_tms", TimestampType) :+
+      StructField("source_system_last_update_tms", TimestampType) :+
+      StructField("dod_deployed_ind", BooleanType) :+
+      StructField("void_ind", BooleanType) :+
+      StructField("stop_cde", StringType) :+
+      StructField("automatically_refill_ind", BooleanType) :+
+      StructField("automatically_renew_ind", BooleanType) :+
+      StructField("renewal_ind", BooleanType) :+
+      StructField("tenant_id", StringType) :+
+      StructField("refill_remaining", LongType) :+
+      StructField("expiration_qty", LongType) :+
+      StructField("prescribed_items", getPrescribedItemsSchema) :+
+      StructField("prescriber", getPrescriberSchema) :+
+      StructField("event", getEventSchema) :+
+      StructField("referral_documents", getRefferalDocumentSchema) :+
+      StructField("for_patient_tmp", getForPatientSchema) :+
+      StructField("previous_for_patient", getPrevForPatientSchema) :+
+      StructField("status", getStatusSchema) :+
+      StructField("receiving_pharmacy_store_key", getRecPhcyStoreSchema) :+
+      StructField("fills", getFillsSchema) :+
+      StructField("scheduled_fill", getscheduledFillSchema) :+
+      StructField("store_key", getStoreKeySchema)
+    )
+
+    val rowRdd = colsRdd.filter(_.nonEmpty).map(Row.fromSeq)
+
+    val df = spark.createDataFrame(rowRdd, dfschema).selectExpr(selCols: _*)
+    val transformedDf = df.
+      withColumn("data_lake_last_update_tms", current_timestamp).
+      withColumn("prescription_id", sha2(col("prescription_resource_id"), 256)).
+      withColumn("temporary_renewed_from_prescription_id", sha2(col("temporary_renewed_from_prescription_resource_id"), 256)).
+      withColumn("from_prescription_transfer_id", sha2(col("transferred_from_prescription_resource_id"), 256)).
+      withColumn("to_prescription_transfer_id", sha2(col("transferred_to_prescription_resource_id"), 256)).
+      withColumn("from_prescription_renewal_resource_id", sha2(col("from_prescription_renewal_id"), 256)).
+      withColumn("to_prescription_renewal_resource_id", sha2(col("to_prescription_renewal_id"), 256)).
+      withColumn("refill_remaining_qty", col("refill_remaining").cast("int")).
+      withColumn("expiration_days_qty", col("expiration_qty").cast("int")).
+      withColumn("source_system_insert_timezone_txt", lit(entityTimeZone)).
+      withColumn("source_system_last_update_timezone_txt", lit(entityTimeZone))
+    transformedDf
+  }
+
+
+  def getBool(strVal: String, key: String = "Y") = {
+    if (strVal.eq(null)) null
+    else if (strVal.equalsIgnoreCase(key)) true else false
+  }
+  def getBoolConv(strVal: String, key: String = "1") = {
+    if (strVal.eq(null)) null
+    else if (strVal == key) true else false
+  }
+
+
+  //prescribed_items
+  def getPrescribedItems(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "category"),
+      getTimeStamp(getJSONValue[String](jVal, "createdDateTime")),
+      getJSONValue[String](jVal, "createdDateTime"),
+      if (getJSONValue[String](jVal, "createdDateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](jVal, "dosageUnits"),
+      getJSONValue[String](jVal, "directions"),
+      getJSONValue[String](jVal, "doseFrequency"),
+      getJSONValue[String](jVal, "item.type"),
+      getJSONValue[Boolean](jVal, "item.compoundIndicator"),
+      getJSONValue[String](jVal, "item.drugNumber"),
+      getJSONValue[String](jVal, "item.resourceId"),
+      getJSONValue[String](jVal, "note"),
+      getJSONValue[String](jVal, "patientDaw.description"),
+      getJSONValue[String](jVal, "patientDaw.name"),
+      getJSONValue[String](jVal, "prescriberDaw.description"),
+      getJSONValue[String](jVal, "prescriberDaw.name"),
+      getJSONValue[String](jVal, "relativeId"),
+      getJSONValue[String](jVal, "drugRoute"),
+      getTimeStamp(getJSONValue[String](jVal, "updatedDateTime")),
+      getJSONValue[String](jVal, "updatedDateTime"),
+      if (getJSONValue[String](jVal, "updatedDateTime").eq(null)) ""
+      else entityTimeZone,
+      " ",
+      {
+
+        val cycle_qty = getJSONValue[Any](jVal, "cycleDaysQuantity")
+        if(cycle_qty == null) 0 else cycle_qty.toString.toDouble.floor.toInt
+      },
+      {
+        val days_qty = getJSONValue[Any](jVal, "daysSupplyQuantity")
+        if(days_qty == null) 0 else days_qty.toString.toDouble.floor.toInt
+      },
+      getJSONValue[Double](jVal, "dosageQuantity"),
+      {
+        val label_qty = getJSONValue[Any](jVal, "numLabelsToPrint")
+        if(label_qty == null) 0 else label_qty.toString.toDouble.floor.toInt
+      },
+      {
+        val daily_qty = getJSONValue[String](jVal, "dailyDosage")
+        if(daily_qty == null) 0.0 else daily_qty.toDouble
+      },
+      {
+        val itemType =  getJSONValue[String](jVal, "item.type")
+        val itemId = getJSONValue[String](jVal, "item.resourceId")
+        if (itemType.eq(null)) null
+        else {
+          if (itemType == "Drug") itemId else null
+        }
+      },
+      getJSONValue[String](jVal, "quantityUnits"),
+      getJSONValue[Double](jVal, "quantity"),
+      getPrecItemStoreKeyList(jVal),
+      getPrecItemStoreKeyList(jVal,"item.")
+    ))
+  }
+
+  def getPrescribedItemList(jVal: JValue): Array[Row] = {
+    val prescItemList = getJSONValue[List[JObject]](jVal, "payload.prescribedItems")
+    if (prescItemList == null) Array() else {
+      prescItemList.map(p => if (p == null) null else getPrescribedItems(p, parentKey = "")).toArray
+    }
+  }
+
+  // prescribed_item_store_key,item_store_key
+
+  def getPrecItemStoreKeyList(jVal: JValue, sourceStr: String = ""): List[Row] = {
+    val (pkeyName) = (s"$sourceStr" + "storeKeySet.primaryKey")
+    val (pkList) = (getJSONValue[List[JObject]](jVal, pkeyName))
+    val primaryStoreInd = pkList != null
+    val pkCheck = if (primaryStoreInd) {
+      val pk = List(loop(jVal, pkeyName.split("\\.")).asInstanceOf[JObject])
+      getPrecStoreKeyVal(pk, true)
+    } else List(): List[Row]
+    pkCheck
+  }
+
+  def getPrecStoreKeyVal(list: List[JObject], storeInd: Boolean): List[Row] = {
+    val kc = List(("", ""))
+    if (list == null) List(): List[Row]
+    else list.map(x => {
+      (
+        getJSONValue[String](x, "storeName"),
+        getJSONValue[String](x, "keyName"),
+        storeInd,
+        if (getJSONValue[List[JObject]](x, "keyComponents").eq(null)) kc
+        else (getJSONValue[List[JObject]](x, "keyComponents").
+          map(x => (getJSONValue[String](x, "name"), getJSONValue[String](x, "value"))))
+      )
+    }).flatMap {
+      case (b, c, d, e) => e.map(v => Row.fromSeq(Seq(b, c, d, v._1, v._2)))
+    }
+  }
+
+
+  //prescriber
+  def getPrescriber(jVal: JValue, parentKey: String, ind: Boolean): Row = {
+    Row.fromSeq(Seq(
+      ind,
+      getJSONValue[String](jVal, s"${parentKey}dea"),
+      getJSONValue[String](jVal, s"${parentKey}fax"),
+      getJSONValue[String](jVal, s"${parentKey}name.first"),
+      getJSONValue[String](jVal, s"${parentKey}npi"),
+      getJSONValue[String](jVal, s"${parentKey}name.last"),
+      getJSONValue[String](jVal, s"${parentKey}phoneNumber"),
+      getJSONValue[Boolean](jVal,s"${parentKey}patientProvidedIndicator"),
+      getJSONValue[String](jVal, s"${parentKey}resourceId"),
+      getJSONValue[String](jVal, s"${parentKey}stateLicense"),
+      getJSONValue[String](jVal, s"${parentKey}postalAddress.city"),
+      getJSONValue[String](jVal, s"${parentKey}postalAddress.country.iso2Code"),
+      getJSONValue[String](jVal, s"${parentKey}postalAddress.country.iso3Code"),
+      getJSONValue[String](jVal, s"${parentKey}postalAddress.postalCode"),
+      getJSONValue[String](jVal, s"${parentKey}postalAddress.state.code"),
+      getJSONValue[String](jVal, s"${parentKey}postalAddress.state.name"),
+      getJSONValue[String](jVal, s"${parentKey}medicalEducationNumber"),
+      getJSONValue[String](jVal, s"${parentKey}pharmacyPracticeNumber"),
+      {
+        val StreetAddrList = getJSONValue[List[JValue]](jVal, s"${parentKey}streetAddress")
+        if (StreetAddrList.eq(null)) null else StreetAddrList.map(x => getVal[String](x)).filterNot(_ == null)
+      }
+    ))
+  }
+
+  def getPrescriberList(jVal: JValue): Array[Row] = {
+    val renewalPrescriberList = getJSONValue[List[JObject]](jVal, "payload.renewalPrescriber")
+    val prescriberList = getJSONValue[List[JObject]](jVal, "payload.prescriber")
+    val renewalPrescriber = {
+      if (renewalPrescriberList == null) List(): List[Row]
+      else List(getPrescriber(jVal, "payload.renewalPrescriber.", true))
+    }
+    val prescriber = {
+      if (prescriberList == null) List(): List[Row]
+      else List(getPrescriber(jVal, "payload.prescriber.", false))
+    }
+    renewalPrescriber ::: prescriber
+  }.toArray
+
+
+  // event
+  def getPrescEvent(jVal: JValue, parentKey: String, ind: Boolean): Row = {
+    Row.fromSeq(Seq(
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}eventDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}eventDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}eventDateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](jVal, s"${parentKey}sourceApplication"),
+      getJSONValue[String](jVal, s"${parentKey}type"),
+      getJSONValue[String](jVal, s"${parentKey}user"),
+      ind
+    ))
+  }
+
+  def getEventsList(jVal: JValue): Array[Row] = {
+    val eventsList = getJSONValue[List[JObject]](jVal, "payload.events")
+    val eventList = getJSONValue[List[JObject]](jVal, "payload.event")
+    val events = {
+      if (eventsList == null) List(): List[Row] else {
+        eventsList.map(p => if (p == null) null else getPrescEvent(p, "", true))
+      }
+    }
+    val event = {
+      if (eventList == null) List(): List[Row]
+      else List(getPrescEvent(jVal, "payload.event.", false))
+    }
+    (events ::: event).toArray
+  }
+
+
+  // referral_documents
+  def getReferralDocs(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "fileNetDocId"),
+      getTimeStamp(getJSONValue[String](jVal, "createdDateTime")),
+      getJSONValue[String](jVal, "createdDateTime"),
+      if (getJSONValue[String](jVal, "createdDateTime").eq(null)) ""
+      else entityTimeZone
+    ))
+  }
+
+  def getReferralDocsList(jVal: JValue): Array[Row] = {
+    val referralList = getJSONValue[List[JObject]](jVal, "payload.referralDocuments")
+    if (referralList == null) Array() else {
+      referralList.map(p => if (p == null) null else getReferralDocs(p, "")).toArray
+    }
+  }
+
+  // for_patient
+  def getForPatient(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, s"${parentKey}customerNumber"),
+      getJSONValue[String](jVal, s"${parentKey}mailGroup"),
+      getJSONValue[String](jVal, s"${parentKey}patientAGN"),
+      getJSONValue[String](jVal, s"${parentKey}personNumber"),
+      getJSONValue[String](jVal, s"${parentKey}resourceId"),
+      getJSONValue[String](jVal, s"${parentKey}specialtyProfileId"),
+      getJSONValue[String](jVal, s"${parentKey}subGroup"),
+      getJSONValue[String](jVal, s"${parentKey}type"),
+      getJSONValue[String](jVal, s"${parentKey}membershipId")
+    ))
+  }
+  def getForPatientList(jVal: JValue): Array[Row] = {
+    val patientList = getJSONValue[List[JObject]](jVal, "payload.forPatient")
+    if (patientList == null) Array() else Array(getForPatient(jVal, "payload.forPatient."))
+  }
+
+  // previous_for_patient
+  def getPrevForPatient(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "resourceId"),
+      getJSONValue[String](jVal, "specialtyProfileId"),
+      getJSONValue[String](jVal, "type"),
+      getTimeStamp(getJSONValue[String](jVal, "expirationDateTime")),
+      getJSONValue[String](jVal, "expirationDateTime"),
+      if (getJSONValue[String](jVal, "expirationDateTime").eq(null)) ""
+      else entityTimeZone
+    ))
+  }
+
+  def getPrevForPatientList(jVal: JValue): Array[Row] = {
+    val prevPatientList = getJSONValue[List[JObject]](jVal, "payload.previousForPatients")
+    if (prevPatientList == null) Array() else {
+      prevPatientList.map(p => if (p == null) null else getPrevForPatient(p, "")).toArray
+    }
+  }
+
+
+  //status
+
+  def getPrescStatus(jVal: JValue, parentKey: String, ind: Boolean): Row = {
+    Row.fromSeq(Seq(
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}effectiveDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}value"),
+      getJSONValue[String](jVal, s"${parentKey}effectiveDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}effectiveDateTime").eq(null)) ""
+      else entityTimeZone,
+      ind
+    ))
+  }
+
+  def getPrescStatusList(jVal: JValue): Array[Row] = {
+    val statusesList = getJSONValue[List[JObject]](jVal, "payload.statuses")
+    val statusList = getJSONValue[List[JObject]](jVal, "payload.status")
+    val statuses = {
+      if (statusesList == null) List(): List[Row] else {
+        statusesList.map(p => if (p == null) null else getPrescStatus(p, "", true))
+      }
+    }
+    val status = {
+      if (statusList == null) List(): List[Row]
+      else List(getPrescStatus(jVal, "payload.status.", false))
+    }
+    (statuses ::: status).toArray
+  }
+
+  //receiving_pharmacy_store_key
+
+  def getRecvPhcyStoreVal(list: List[JObject], primary_store_ind: Boolean,parentKey: String): List[Row] = {
+    val kc = List(("", ""))
+    if (list == null) List(): List[Row]
+    else list.map(x => {
+      (
+        getJSONValue[String](x, "storeName"),
+        getJSONValue[String](x, "keyName"),
+        primary_store_ind,
+        if (getJSONValue[List[JObject]](x, "keyComponents").eq(null)) kc
+        else (getJSONValue[List[JObject]](x, "keyComponents").
+          map(x => (getJSONValue[String](x, "name"), getJSONValue[String](x, "value"))))
+      )
+    }).flatMap {
+      case (b, c, d, e) => e.map(v => Row.fromSeq(Seq(b, c, d, v._1, v._2)))
+    }
+  }
+
+  def getRecvPhcyStoreList(jVal: JValue, sourceStr: String = ""): List[Row] = {
+    val (pkeyName) = (s"$sourceStr" + "receivingPharmacy"+ "." + "storeKeySet.primaryKey")
+    val (pkList) = (getJSONValue[List[JObject]](jVal, pkeyName))
+    val primaryStoreInd = pkList != null
+    val pkCheck = if (primaryStoreInd) {
+      val pk = List(loop(jVal, pkeyName.split("\\.")).asInstanceOf[JObject])
+      getPrecStoreKeyVal(pk, true)
+    } else List(): List[Row]
+    pkCheck
+  }
+
+
+  // fills
+  def getFill(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "relativeId"),
+      getJSONValue[Boolean](jVal, "autoRefilledIndicator"),
+      getTimeStamp(getJSONValue[String](jVal, "cflSourceDateTime")),
+      getJSONValue[String](jVal, "externalId"),
+      getTimeStamp(getJSONValue[String](jVal, "fillDateTime")),
+      getJSONValue[String](jVal, "fillNumber"),
+      getJSONValue[String](jVal, "fillType"),
+      getDate(getJSONValue[String](jVal, "refillReminderDate")),
+      getJSONValue[String](jVal, "relativeId"),
+      getDate(getJSONValue[String](jVal, "reorderDate")),
+      getTimeStamp(getJSONValue[String](jVal, "createdDateTime")),
+      getTimeStamp(getJSONValue[String](jVal, "updatedDateTime")),
+      getTimeStamp(getJSONValue[String](jVal, "rflSourceDateTime")),
+      getJSONValue[Boolean](jVal, "isCompleted"),
+      getJSONValue[String](jVal, "originalSource"),
+      getTimeStamp(getJSONValue[String](jVal, "rflSourceDateTime")),
+      getJSONValue[String](jVal, "cflSourceDateTime"),
+      if (getJSONValue[String](jVal, "cflSourceDateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](jVal, "rflSourcedateTime"),
+      if (getJSONValue[String](jVal, "rflSourcedateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](jVal, "rflSourcedateTime"),
+      if (getJSONValue[String](jVal, "rflSourcedateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](jVal, "fillDateTime"),
+      if (getJSONValue[String](jVal, "fillDateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](jVal, "createdDateTime"),
+      if (getJSONValue[String](jVal, "createdDateTime").eq(null)) ""
+      else entityTimeZone,
+      getBool(getJSONValue[String](jVal, "provisionalFillIndicator")),
+      getJSONValue[String](jVal, "dispensingPharmacy.lineOfBusinessCode"),
+      getDate(getJSONValue[String](jVal, "fillDate")),
+      getJSONValue[String](jVal, "fulfillmentCenterId"),
+      getJSONValue[String](jVal, "invoiceNumber"),
+      getJSONValue[String](jVal, "primaryMembership.clientId"),
+      {
+        val actual_qty = getJSONValue[Any](jVal, "actualDispensedQuantity")
+        if(actual_qty == null) 0.0 else actual_qty.toString.toLong.toDouble
+      },
+      {
+        val fill_qty = getJSONValue[Any](jVal, "actualFillQuantity")
+        if(fill_qty == null) 0.0 else fill_qty.toString.toLong.toDouble
+      },
+      getFillStatusList(jVal),
+      getFillDispensingItemList(jVal),
+      getFillEventsList(jVal),
+      getdispensePhcyStoreList(jVal),
+      getFillReplacements(jVal),
+      getFillProtocol(jVal)
+    ))
+  }
+
+  def getFillList(jVal: JValue): Array[Row] = {
+    val fillList = getJSONValue[List[JObject]](jVal, "payload.fills")
+    if (fillList == null) Array() else {
+      fillList.map(p => if (p == null) null else getFill(p, "")).toArray
+    }
+  }
+
+
+  //fill_status
+  def getFillStatus(jVal: JValue, parentKey: String, ind: Boolean): Row = {
+    Row.fromSeq(Seq(
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}effectiveDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}value"),
+      ind,
+      getJSONValue[String](jVal, s"${parentKey}effectiveDateTime"),
+      entityTimeZone,
+      getStatusDetail(jVal,"status."),
+      getStatusExplaination(jVal,"status.")
+    ))
+  }
+
+  def getFillStatusList(jVal: JValue): List[Row] = {
+    val statusesList = getJSONValue[List[JObject]](jVal, "statuses")
+    val statusList = getJSONValue[List[JObject]](jVal, "status")
+    val statuses = {
+      if (statusesList == null) List(): List[Row] else {
+        statusesList.map(p => if (p == null) null else getFillStatus(p, "", false))
+      }
+    }
+    val status = {
+      if (statusList == null) List(): List[Row]
+      else List(getFillStatus(jVal, "status.", true))
+    }
+    (statuses ::: status)
+  }
+
+  // fill_status_detail
+  def getStatusDetail(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "detail.cflCancelCode"),
+      getJSONValue[String](jVal, "detail.cflStopFlag"),
+      getJSONValue[String](jVal, "detail.code")
+    ))
+  }
+  // fill_status_explaination
+  def getStatusExplaination(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "explanation.code"),
+      getJSONValue[String](jVal, "explanation.message"),
+      getJSONValue[String](jVal, "explanation.sobaCode")
+    ))
+  }
+
+
+  // fill_dispensing_item
+  def getFillDispensingItemList(jVal: JValue): List[Row] = {
+    val fillDispensingList = getJSONValue[List[JObject]](jVal, "dispensedItems")
+    if (fillDispensingList == null) List(): List[Row]
+    else fillDispensingList.map(x => Row.fromSeq(Seq(
+      getJSONValue[String](x, "category"),
+      getJSONValue[String](x, "directions"),
+      getJSONValue[String](x, "dosageUnits"),
+      getJSONValue[String](x, "doseFrequency"),
+      getJSONValue[String](x, "item.type"),
+      getJSONValue[Boolean](x, "item.compoundIndicator"),
+      getJSONValue[String](x, "item.drugNDC"),
+      getJSONValue[String](x, "item.drugNumber"),
+      getJSONValue[String](x, "item.resourceId"),
+      getJSONValue[String](x, "note"),
+      getJSONValue[String](x, "daw.description"),
+      getJSONValue[String](x, "daw.name"),
+      getJSONValue[String](x, "prescribedItemRelativeId"),
+      getJSONValue[String](x, "relativeId"),
+      getTimeStamp(getJSONValue[String](x, "createdDateTime")),
+      getJSONValue[String](x, "createdDateTime"),
+      if (getJSONValue[String](x, "createdDateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](x, "drugRoute"),
+      getTimeStamp(getJSONValue[String](x, "updatedDateTime")),
+      getJSONValue[String](x, "updatedDateTime"),
+      if (getJSONValue[String](x, "updatedDateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](x, "quantityUnits"),
+      "",
+      {
+        val cycle_qty = getJSONValue[Any](x, "cycleDaysQuantity")
+        if(cycle_qty == null) 0 else cycle_qty.toString.toDouble.floor.toInt
+      },
+      {
+        val days_qty = getJSONValue[Any](x, "daysSupplyQuantity")
+        if(days_qty == null) 0 else days_qty.toString.toDouble.floor.toInt
+      },
+      getJSONValue[Double](x, "dosageQuantity"),
+      {
+        val label_qty = getJSONValue[Any](x, "numLabelsToPrint")
+        if(label_qty == null) 0 else label_qty.toString.toDouble.floor.toInt
+      },
+      {
+        val itemType =  getJSONValue[String](x, "item.type")
+        val itemId = getJSONValue[String](x, "item.resourceId")
+        if (itemType.eq(null)) null
+        else {
+          if (itemType == "Drug") itemId else null
+        }
+      },
+      getJSONValue[Double](x, "quantity"),
+      getPrecItemStoreKeyList(x),
+      getPrecItemStoreKeyList(x,"item")
+    )))
+  }
+
+
+  //fill_event
+  def getFillEventsList(jVal: JValue): List[Row] = {
+    val fillEventsList = getJSONValue[List[JObject]](jVal, "events")
+    val fillEventList = getJSONValue[List[JObject]](jVal, "event")
+    val events = {
+      if (fillEventsList == null) List(): List[Row] else {
+        fillEventsList.map(p => if (p == null) null else getPrescEvent(p, "", false))
+      }
+    }
+    val event = {
+      if (fillEventList == null) List(): List[Row]
+      else List(getPrescEvent(jVal, "event.", true))
+    }
+    events ::: event
+  }
+
+//fill_dispensing_pharmacy_store_key
+
+  def getdispensePhcyStoreList(jVal: JValue, sourceStr: String = ""): List[Row] = {
+    val (pkeyName) = (s"$sourceStr" + "dispensingPharmacy"+ "." + "storeKeySet.primaryKey")
+    val (pkList) = (getJSONValue[List[JObject]](jVal, pkeyName))
+    val primaryStoreInd = pkList != null
+    val pkCheck = if (primaryStoreInd) {
+      val pk = List(loop(jVal, pkeyName.split("\\.")).asInstanceOf[JObject])
+      getPrecStoreKeyVal(pk, true)
+    } else List(): List[Row]
+    pkCheck
+  }
+
+  // fill_replacement
+
+  def getFillReplacements(jVal: JValue): List[Row] = {
+    val fillReplaceList = getJSONValue[List[JObject]](jVal, "replacements")
+    if (fillReplaceList == null) List(): List[Row]
+    else fillReplaceList.map(x => Row.fromSeq(Seq(
+      getJSONValue[String](x, "relativeId"),
+      getTimeStamp(getJSONValue[String](x, "createdDateTime")),
+      getJSONValue[String](x, "createdDateTime"),
+      if (getJSONValue[String](x, "createdDateTime").eq(null)) ""
+      else entityTimeZone
+    )))
+  }
+
+  // fill_protocol
+
+  def getFillProtocol(jVal: JValue): List[Row] = {
+    val fillProtocolList = getJSONValue[List[JObject]](jVal, "protocols")
+    if (fillProtocolList == null) List(): List[Row]
+    else fillProtocolList.map(x => Row.fromSeq(Seq(
+      getTimeStamp(getJSONValue[String](x, "protocolDateTime")),
+      getJSONValue[String](x, "protocolDateTime"),
+      if (getJSONValue[String](x, "protocolDateTime").eq(null)) ""
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "createdDateTime")),
+      getJSONValue[String](x, "createdDateTime"),
+      if (getJSONValue[String](x, "createdDateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](x, "fulfillmentCenterId"),
+      getJSONValue[String](x, "protocolReason"),
+      getTimeStamp(getJSONValue[String](x, "protocolResolutionDateTime")),
+      getJSONValue[String](x, "protocolResolutionDateTime"),
+      if (getJSONValue[String](x, "protocolResolutionDateTime").eq(null)) ""
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "updatedDateTime")),
+      getJSONValue[String](x, "updatedDateTime"),
+      if (getJSONValue[String](x, "updatedDateTime").eq(null)) ""
+      else entityTimeZone,
+      {
+        val seq_nbr = getJSONValue[Any](x, "sequenceNumber")
+        if(seq_nbr == null) 0 else seq_nbr.toString.toLong.toInt
+      },
+      {
+        val inv_nbr = getJSONValue[Any](x, "invoiceNumber")
+        if(inv_nbr == null) "" else inv_nbr.toString
+      }
+    )))
+  }
+
+  // scheduled_fill
+  def getScheduled(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}createdDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}createdDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}createdDateTime").eq(null)) ""
+      else entityTimeZone,
+      getDate(getJSONValue[String](jVal, s"${parentKey}nextFillDate")),
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}penFinalDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}penFinalDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}penFinalDateTime").eq(null)) ""
+      else entityTimeZone,
+      getJSONValue[String](jVal, s"${parentKey}status"),
+      getJSONValue[String](jVal, s"${parentKey}type"),
+      getJSONValue[String](jVal, s"${parentKey}updateUser"),
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}updatedDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}updatedDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}updatedDateTime").eq(null)) ""
+      else entityTimeZone
+    ))
+  }
+
+  def getScheduledList(jVal: JValue): Array[Row] = {
+    val scheduleList = getJSONValue[List[JObject]](jVal, "payload.scheduledFill")
+    if (scheduleList == null) Array() else Array(getScheduled(jVal, "payload.scheduledFill."))
+  }
+
+  //store_key
+
+  def getStoreKeyList(jVal: JValue, sourceStr: String = ""): List[Row] = {
+    val skeyName = s"$sourceStr" + "secondaryKeys"
+    val skList = getJSONValue[List[JObject]](jVal, skeyName)
+    val secStoreInd = skList != null
+    val skCheck = if (secStoreInd) {
+      getStoreKeyVal(skList, true)
+    } else List(): List[Row]
+    skCheck
+  }
+
+  def getStoreKeyVal(list: List[JObject], secondary_store_ind: Boolean): List[Row] = {
+    val kc = List(("", ""))
+    if (list == null) List(): List[Row]
+    else list.map(x => {
+      (
+        getJSONValue[String](x, "storeName"),
+        getJSONValue[String](x, "keyName"),
+        secondary_store_ind,
+        if (getJSONValue[List[JObject]](x, "keyComponents").eq(null)) kc
+        else (getJSONValue[List[JObject]](x, "keyComponents").
+          map(x => (getJSONValue[String](x, "name"), getJSONValue[String](x, "value"))))
+      )
+    }).flatMap {
+      case (b, c, d, e) => e.map(v => Row.fromSeq(Seq(b, c, d, v._1, v._2)))
+    }
+  }
+
+  override def save(df: DataFrame, spark: SparkSession, hbaseCtx: HBaseContext, config: Config): (Long, String) = null
+
+}
