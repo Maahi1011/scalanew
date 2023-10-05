@@ -1,0 +1,184 @@
+package com.hs.bdes.prescription
+
+import com.esi.dpe.config.ConfigParser
+import com.esi.dpe.custom.Transform
+import com.hs.bdes.util.JsonUtils.{getJSONValue, getVal, loop}
+import com.hs.bdes.util.TimeZoneUtils._
+import com.typesafe.config.Config
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.expressions.UserDefinedFunction
+import org.apache.spark.sql.functions._
+import org.json4s.jackson.JsonMethods.parse
+import org.json4s.{JObject, JValue}
+
+import java.sql.{Date, Timestamp}
+import scala.collection.JavaConverters._
+import scala.util.Try
+
+class PrescriptionEntityTransform extends Transform with LazyLogging with Serializable {
+
+  def parseJson(str: String): JValue = Try {
+    parse(str)
+  }.getOrElse(null)
+
+	case class getItemStoreKeySchema(store_nme: String, key_nme: String, primary_store_ind: Boolean, component_nme: String, component_value_txt: String)
+
+	case class getPrescribedItemStoreKeySchema(store_nme: String, key_nme: String, primary_store_ind: Boolean, component_nme: String, component_value_txt: String,  item_store_key: List[getItemStoreKeySchema])
+
+	case class getPrescribedItemsSchema(item_category_desc: String, created_tms: Timestamp, created_tms_txt: String, created_timezone_txt: String, dosage_units_txt: String, directions_txt: String, dose_frequency_txt: String, item_type_desc: String, item_compound_ind: Boolean, drug_nbr: String, item_resource_id: String, notes_txt: String, patient_dispense_as_written_desc: String, patient_dispense_as_written_nme: String, prescriber_dispense_as_written_desc: String, prescriber_dispense_as_written_nme: String, prescribed_item_relative_id: String, drug_route_txt: String, last_updated_tms: Timestamp, last_updated_tms_txt: String, last_updated_timezone_txt: String, supply_id: String, cycle_days_qty: Integer, days_supply_qty: Integer, dosage_qty: Double, label_print_qty: Integer, daily_dosage_qty: Double, dispensed_quantity_unit_txt: String, dispensed_qty: Double, prescribed_item_store_key: List[getPrescribedItemStoreKeySchema])
+
+	case class getPrescriberSchema(renewal_ind: Boolean, dea_nbr: String, fax_nbr: String, first_nme: String, npi_nbr: String, last_nme: String, phone_nbr: String, patient_provided_ind: Boolean, pracitioner_resource_id: String, state_license_nbr: String, city_nme: String, country_iso2_cde: String, country_iso3_cde: String, postal_cde: String, state_cde: String, state_nme: String, medical_education_nbr: String, pharmacy_practice_nbr: String, street_address_txt: List[String])
+
+	case class getEventSchema(event_tms: Timestamp, event_tms_txt: String, event_timezone_txt: String, source_application_nme: String, event_type_desc: String, source_application_user_nme: String, current_ind: Boolean)
+
+	case class getReferral_documentsSchema(referral_document_file_id: String, referral_document_reference_creation_tms: Timestamp, referral_document_reference_creation_tms_txt: String, referral_document_reference_creation_timezone_txt: String)
+
+	case class getForPatientSchema(customer_nbr: String, mail_group_desc: String, patient_automatically_generated_nbr: String, person_nbr: String, person_resource_id: String, specialty_profile_id: String, sub_group_desc: String, previous_patient_type_desc: String, membership_agn_id: String)
+
+	case class getPreviousForPatientSchema(person_resource_id: String, specialty_profile_id: String, patient_type_desc: String, expiration_tms: Timestamp, expiration_tms_txt: String, expiration_timezone_txt: String)
+	
+	case class getStatusSchema(effective_tms: Timestamp, status_desc: String, effective_tms_txt: String, effective_timezone_txt: String, current_ind: Boolean)
+	
+	case class getReceivingPharmacyStoreKeySchema(store_nme: String, key_nme: String, primary_store_ind: Boolean, component_nme: String, component_value_txt: String)
+
+	case class getFillProtocolSchema(protocol_tms: Timestamp, protocol_tms_txt: String, protocol_timezone_txt: String, source_system_created_tms: Timestamp, source_system_created_tms_txt: String, source_system_created_timezone_txt: String, fulfillment_center_id: String, protocol_reason_txt: String, protocol_resolution_tms: Timestamp, protocol_resolution_tms_txt: String, protocol_resolution_Timezone_txt: String, source_system_last_updated_tms: Timestamp, source_system_last_updated_tms_txt: String, source_system_last_updated_timezone_txt: String, sequence_nbr: Integer, invoice_nbr: String)
+
+	case class getFillReplacementSchema(replacement_prescription_fill_relative_id: String, source_system_created_tms: Timestamp, source_system_created_tms_txt: String, source_system_created_timezone_txt: String, fill_protocol: List[getFillProtocolSchema])
+
+	case class getFillDispensingPharmacyStoreKeySchema(store_nme: String, key_nme: String, primary_store_ind: Boolean, component_nme: String, component_value_txt: String, fill_replacement: List[getFillReplacementSchema])
+
+	case class getFillEventSchema(event_tms: Timestamp, event_tms_txt: String, event_timezone_txt: String, source_application_nme: String, event_type_desc: String, source_application_user_nme: String, current_ind: Boolean, fill_dispensing_pharmacy_store_key: List[getFillDispensingPharmacyStoreKeySchema])
+
+	case class getFillItemStoreKeySchema(store_nme: String, key_nme: String, primary_store_ind: Boolean, component_nme: String, component_value_txt: String, fill_event: List[getFillEventSchema])
+
+	case class getFillDispensedItemStoreKeySchema(store_nme: String, key_nme: String, primary_store_ind: Boolean, component_nme: String, component_value_txt: String, fill_item_store_key: List[getFillItemStoreKeySchema])
+
+	case class getFillDispensingItemSchema(item_category_desc: String, directions_txt: String, dosage_units_txt: String, dose_frequency_txt: String, item_type_desc: String, item_compound_ind: Boolean, ndc_nbr: String, drug_nbr: String, item_resource_id: String, notes_txt: String, dispense_as_written_desc: String, dispense_as_written_nme: String, prescribed_item_relative_id: String, dispensed_item_relative_id: String, created_tms: Timestamp, created_tms_txt: String, created_timezone_txt: String, drug_route_txt: String, last_updated_tms: Timestamp, last_updated_tms_txt: String, last_updated_timezone_txt: String, dispensed_quantity_unit_txt: String, supply_id: String, cycle_days_qty: Integer, days_supply_qty: Integer, dosage_qty: Double, label_print_qty: Integer, dispensed_qty: Double, fill_dispensed_item_store_key: List[getFillDispensedItemStoreKeySchema])
+
+	case class getFillStatusExplainationSchema(status_explaination_desc: String, status_explaination_message_txt: String, soba_desc: String, fill_dispensing_item: List[getFillDispensingItemSchema])
+
+	case class getFillStatusDetailSchema(cancel_desc: String, stop_ind: String, status_desc: String, fill_status_explaination: List[getFillStatusExplainationSchema])
+
+	case class getFillStatusSchema(effective_tms: Timestamp, fill_status_txt: String, current_ind: Boolean, effective_tms_txt: String, effective_Timezone_txt: String, fill_status_detail: List[getFillStatusDetailSchema])
+
+	case class getFillsSchema(prescription_fill_id: String, auto_refilled_ind: Boolean, source_system_created_tms: Timestamp, external_id: String, fill_tms: Timestamp, fill_nbr: String, fill_type_desc: String, refill_reminder_dte:date, prescription_Fill_relative_id: String, reorder_dte:date, fill_last_update_tms: Timestamp, source_system_last_update_tms: Timestamp, refill_source_system_tms: Timestamp, completed_ind: Boolean, original_source_system_nme: String, refill_last_update_tms: Timestamp, source_system_created_ Timestamp_txt: String, source_system_created_timezone: String, refill_last_update_tms_txt: String, refill_last_update_timezone: String, refill_source_system_tms_txt: String, refill_source_system_timezone_txt: String, fill_ Timestamp_txt: String, fill_timezone_txt: String, fill_last_update_tms_txt: String, fill_last_update_timezone_txt: String, provisional_fill_ind: Boolean, dispensing_pharmacy_line_of_business_txt: String, fill_dte:date, fulfillment_center_id: String, invoice_nbr: String, primary_membership_client_id: String, actual_dispensed_qty: Double, actual_fill_qty: Double, fill_status: List[getFillStatusSchema])
+	
+	case class getScheduledFillSchema(created_tms: Timestamp, created_tms_txt: String, created_timezone_txt: String, next_fill_dte: Date, pending_final_tms: Timestamp, pending_final_tms_txt: String, pending_final_timezone_txt: String, status_desc: String, scheduled_fill_type_desc: String, source_system_last_update_user_id: String, source_system_last_update_tms: Timestamp, source_system_last_update_tms_txt: String, source_system_last_update_timezone_txt: String)
+	
+	case class getStoreKeySchema(store_nme: String, key_nme: String, secondary_store_ind: Boolean, component_nme: String, component_value_txt: String)
+	
+	
+	
+	
+	
+	
+	//Store_Key
+	
+	private def getStoreKeys: UserDefinedFunction = udf((jsonStr: String) => {
+    val jObj = parseJson(jsonStr)
+    val storeKeys = getStoreKeyList(jObj, "payload.")
+    storeKeys
+
+  })
+
+	def getStoreKeyList(jVal: JValue, sourceStr: String = ""): List[getStoreKeySchema] = {
+    val skeyName = s"$sourceStr" + "secondaryKeys"
+    val skList = getJSONValue[List[JObject]](jVal, skeyName)
+    val secStoreInd = skList != null
+    val skCheck = if (secStoreInd) {
+      getStoreKeyVal(skList, true)
+    } else List(): List[getStoreKeySchema]
+    skCheck
+  }
+
+	def getStoreKeyVal(list: List[JObject], secondary_store_ind: Boolean): List[getStoreKeySchema] = {
+    val kc = List(("", ""))
+    if (list == null) List(): List[getStoreKeySchema]
+    else list.map(x => {
+      (
+        getJSONValue[String](x, "storeName"),
+        getJSONValue[String](x, "keyName"),
+        secondary_store_ind,
+        if (getJSONValue[List[JObject]](x, "keyComponents").eq(null)) kc
+        else (getJSONValue[List[JObject]](x, "keyComponents").
+          map(x => (getJSONValue[String](x, "name"), getJSONValue[String](x, "value"))))
+      )
+    }).flatMap {
+      case (b, c, d, e) => e.map(v => getStoreKeySchema.fromSeq(Seq(b, c, d, v._1, v._2)))
+    }
+  }
+  
+	
+	
+	
+ override def doTransform(input: ConfigParser.DPFConfig, df: DataFrame, config: Config): DataFrame = {
+   //val jsonCol = "kafka_value"
+
+    val initDf = df
+
+    //val outputColsOrder = input.custom.getJSONArray("columns_order").iterator.asScala.toList.map(_.toString)
+
+
+    val tempDf = initDf.
+      withColumn("prescribed_items", getPrescribedItems(col("kafka_value"))).
+      withColumn("prescriber", getPrescriberSchema(col("kafka_value"))).
+      withColumn("event", getEventSchema(col("kafka_value"))).
+      withColumn("referral_documents", getReferral_documentsSchema(col("kafka_value"))).
+      withColumn("for_patient", getForPatientSchema(col("kafka_value"))).
+      withColumn("previous_for_patient", getPreviousForPatientSchema(col("kafka_value"))).
+      withColumn("status", getStatusSchema(col("kafka_value"))).
+      withColumn("receiving_pharmacy_store_key", getReceivingPharmacyStoreKeySchema(col("kafka_value"))).
+      withColumn("fills", getFillsSchema(col("kafka_value"))).
+	  
+      withColumn("scheduled_fill", getOthers(col("kafka_value"))).
+	  withColumn("store_key", getStoreKeys(col("kafka_value")))
+
+
+
+    val transformedDf = tempDf.withColumn("data_lake_last_update_tms", current_timestamp)
+      .withColumn("medical_education_nbr_status_effective_tms",
+        to_timestamp(col("medical_education_nbr_status_effective_tms_txt")))
+      .withColumn("medical_education_nbr_status_effective_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("medical_education_nbr_status_expiration_tms",
+        to_timestamp(col("medical_education_nbr_status_expiration_tms_txt")))
+      .withColumn("medical_education_nbr_status_expiration_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("military_id_status_effective_tms",
+        to_timestamp(col("military_id_status_effective_tms_txt")))
+      .withColumn("military_id_status_effective_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("military_id_status_expiration_tms",
+        to_timestamp(col("military_id_status_expiration_tms_txt")))
+      .withColumn("military_id_status_expiration_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("npi_status_effective_tms",
+        to_timestamp(col("npi_status_effective_tms_txt")))
+      .withColumn("npi_status_effective_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("npi_status_expiration_tms",
+        to_timestamp(col("npi_status_expiration_tms_txt")))
+      .withColumn("npi_status_expiration_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("spi_id_status_effective_tms",
+        to_timestamp(col("spi_id_status_effective_tms_txt")))
+      .withColumn("spi_id_status_effective_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("spi_id_status_expiration_tms",
+        to_timestamp(col("spi_id_status_expiration_tms_txt")))
+      .withColumn("spi_id_status_expiration_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("status_effective_tms",
+        to_timestamp(col("status_effective_tms_txt")))
+      .withColumn("status_effective_timezone_txt", lit(entityTimeZone))
+
+      .withColumn("status_expiration_tms",
+        to_timestamp(col("status_expiration_tms_txt")))
+      .withColumn("status_expiration_timezone_txt", lit(entityTimeZone))
+      .withColumn("tenant_id", col("tenant_id").cast("decimal(18)"))
+
+    transformedDf.where("tenant_id == '1'")
+  }
+
+}
