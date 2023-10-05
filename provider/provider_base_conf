@@ -1,0 +1,84 @@
+spark-config {
+}
+metastore {
+  type: "delta"
+  vacuum: 24
+  table: "`en_dlake_dev`.work_cnfz.cnfz_metastore"
+}
+extended: true
+
+
+source {
+  project.name: "PROVIDERORG_CNFZ-PROVIDERORG_BASE-CNFZ"
+  mapping: [
+    {
+      "index": 1
+      "id": "po"
+	  "source": "s3"
+      "location": "`en_dlake_dev`.entity_rawz.medicalpractice"
+      "format": "delta"
+      "options": {"readChangeFeed": "true"}
+      "stream": true
+      "join": "po"
+	  "column.family": "raw"
+	  "doTransform": "com.hs.bdes.providerorg.ProviderOrgEntityTransform"
+      "custom": """
+        {
+          "mapping": {
+            "kafka_ts": "KAFKA_TS",
+            "kafka_value": "KAFKA_VALUE",
+			"kafka_key": "KAFKA_KEY"
+          },
+          "json-mapping": {
+            "provider_organization_id": "get_json_object(kafka_value, '$.payload.resourceId')",
+            "provider_organization_resource_id": "get_json_object(kafka_value, '$.payload.resourceId')",
+            "legal_nm": "get_json_object(kafka_value, '$.payload.name.legal')"
+          }
+        }
+      """
+    }
+  ]
+
+}
+
+target {
+  place: "s3"
+  options: {
+    location: "en_dlake_dev.work_cnfz.provider_organization_base"
+    streamCheckpointLocation: "s3://hs-bdes-dev-logs/claims/work/checkpoint4stream/provider_organization_base"
+    streamInterval: "AvailableNow"
+    header: "false"
+    format:"delta"
+    coalesce:10
+    compression:"snappy"
+    mode:"upsert"
+    stream: true
+    delta: {
+     upsert: {
+       condition: "target.provider_organization_id = source.provider_organization_id"
+      }
+     }
+  }
+  "cols-order": [
+    "provider_organization_id",
+    "provider_organization_resource_id",
+    "npi_num",
+    "legal_nm",
+    "doing_business_as_nmes",
+    "former_legal_nmes",
+    "alternative_nmes",
+    "tenant_id",
+    "provider_organization_store_key",
+    "provider_organization_taxonomy",
+    "provider_organization_email_address",
+    "provider_organization_phone",
+    "provider_organization_postal_address",
+    "provider_organization_dea_id",
+    "provider_organization_medicaid_id",
+    "provider_organization_npi",
+    "provider_organization_spi",
+    "data_lake_last_update_ts"
+  ]
+}
+
+
