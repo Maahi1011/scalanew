@@ -1,0 +1,60 @@
+package com.esi.dpe.practitioner
+
+import com.esi.dpe.practitionerList.PractitionerListSchema._
+import com.typesafe.config.Config
+import com.yotabites.config.ConfigParser.DPFConfig
+import com.yotabites.custom.HDFSTransform
+import com.yotabites.utils.AppUtils
+import org.apache.spark.sql.functions.{broadcast, col, sha2, _}
+import org.apache.spark.sql.{DataFrame, SparkSession}
+
+import scala.collection.JavaConverters._
+
+
+class PractitionerConformed extends HDFSTransform with Serializable {
+  override def transform(spark: SparkSession, config: DPFConfig): DataFrame = null
+
+  override def save(df: DataFrame, spark: SparkSession, config: Config): (Long, String) = {
+    val tempLandPath = config.getString("target.temp.path")
+    val dodCarriersPath = config.getString("target.dod.carriers.table")
+    val pickForPrCols = config.getStringList("target.pick-for-pr").asScala.toList
+    val pickForPrLsPrCols = config.getStringList("target.pick-for-pr-ls-pr").asScala.toList
+
+    AppUtils.writeTargetDataFrame(spark, df, config, location = tempLandPath, doNotCount = true)
+
+    val allPractitionerDf = spark.read.orc(tempLandPath)
+    val carriersDf = spark.read.orc(dodCarriersPath)
+      .withColumnRenamed("client_org_operational_id", "client_organization_operational_id")
+    val prList = allPractitionerDf.selectExpr(pickForPrCols: _*)
+    val prListPr = allPractitionerDf.
+      withColumn("plp", expr("explode(plpCols)")).
+      selectExpr(allPractitionerDf.columns :+ "plp.*": _*).
+      withColumn("practitioner_id", sha2(col(plpSurKey), 256)).selectExpr(pickForPrLsPrCols: _*)
+    val restrictedCarriers = carriersDf.
+      where("trim(client_data_restriction_cde) = 'DOD'").
+      selectExpr("client_organization_operational_id").distinct()
+
+    val (cn1, st1) = writeData(prList, restrictedCarriers, spark, config, "prList")
+    val (cn2, st2) = writeData(prListPr, restrictedCarriers, spark, config, "prListPr")
+    (cn1, s"""{"pr_list": $st1,"pr_list_pr": $st2 }""")
+  }
+
+  def writeData(outDf: DataFrame, restrictedOprId: DataFrame, spark: SparkSession, config: Config, outFile: String): (Long, String) = {
+    val validOrgOprIdDf = outDf.filter("client_organization_operational_id is not null")
+    val errorDf = outDf.filter("client_organization_operational_id is null").
+      selectExpr(outDf.columns: _*)
+    val dodDf = validOrgOprIdDf.join(broadcast(restrictedOprId), Seq("client_organization_operational_id"), "inner").
+      selectExpr(outDf.columns: _*)
+    val commSoc2Df = validOrgOprIdDf.join(broadcast(restrictedOprId), Seq("client_organization_operational_id"), "left_anti").
+      selectExpr(outDf.columns: _*)
+    // Write to target
+    val commCt = AppUtils.writeTargetDataFrame(spark, commSoc2Df, config, config.getString(s"target.options.comm.location.$outFile"))
+    val dodCt = AppUtils.writeTargetDataFrame(spark, dodDf, config, config.getString(s"target.options.dod.location.$outFile"))
+    val errCt = AppUtils.writeTargetDataFrame(spark, errorDf, config, config.getString(s"target.options.error.location.$outFile"))
+
+    (commCt + dodCt + errCt, s"""{"comm & soc2": $commCt, "dod": $dodCt, "error": $errCt}""")
+
+  }
+
+}
+
