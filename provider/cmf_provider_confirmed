@@ -1,0 +1,24 @@
+package com.esi.dpe.providerOrg
+
+import com.typesafe.config.Config
+import com.yotabites.config.ConfigParser.DPFConfig
+import com.yotabites.custom.HDFSTransform
+import com.yotabites.utils.AppUtils
+import org.apache.spark.sql.expressions.UserDefinedFunction
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
+import scala.collection.JavaConverters._
+import scala.collection.mutable
+
+class ProviderOrgConformed extends HDFSTransform with Serializable {
+
+  override def transform(spark: SparkSession, config: DPFConfig): DataFrame = null
+
+  override def save(df: DataFrame, spark: SparkSession, config: Config): (Long, String) = {
+    val poCols = config.getStringList("target.po-cols").asScala.toList
+    val out = df.selectExpr(poCols: _*)
+    val poCt = AppUtils.writeTargetDataFrame(spark, out, config, config.getString("target.options.location"))
+    (poCt, s"""{"providerOrganizationCount": $poCt}""")
+  }
+}
