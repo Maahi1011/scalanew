@@ -1,0 +1,677 @@
+package com.esi.dpe.providerOrg
+
+import com.typesafe.config.Config
+import com.typesafe.scalalogging.LazyLogging
+import com.yotabites.config.ConfigParser.DPFConfig
+import com.yotabites.custom.HBaseTransform
+import org.apache.hadoop.hbase.client.Scan
+import org.apache.hadoop.hbase.spark.HBaseContext
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.hadoop.hbase.{CellUtil, TableName}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.{StructField, _}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+import org.json4s._
+import org.json4s.jackson.JsonMethods._
+import com.esi.dpe.utils.JsonUtils.{getJSONValue, _}
+import scala.collection.JavaConverters._
+import scala.util.Try
+import com.esi.dpe.providerOrg.ProviderOrgSchema._
+import com.esi.dpe.utils.TimeZoneUtils._
+import java.text.SimpleDateFormat
+import java.util.{Calendar, Date}
+
+class ProviderOrgEntityTransform extends HBaseTransform with LazyLogging with Serializable {
+  override def transform(config: DPFConfig, spark: SparkSession, hbaseCtx: HBaseContext, scan: Scan): DataFrame = {
+    import spark.implicits._
+
+    val tableName = config.location
+    val cf = config.columnFamily
+    val jsonCol = "KAFKA_VALUE"
+    val directPoMap = config.custom.getJSONObject("provider_org_mapping")
+    val provOrgMapping = directPoMap.keySet.asScala.toList.map(x => (x, directPoMap.getString(x)))
+    scan.addColumn(cf.getBytes, jsonCol.getBytes)
+    val hbaseRdd = hbaseCtx.hbaseRDD(TableName.valueOf(tableName), scan).
+      filter(x => new String(x._1.copyBytes).startsWith("ERROR").unary_!)
+    val colsRdd: RDD[List[Any]] = hbaseRdd.map(x => {
+      val jsonStr = Bytes.toString(CellUtil.cloneValue(
+        x._2.getColumnLatestCell(cf.getBytes, jsonCol.getBytes)
+      ))
+
+      val jObj = Try {
+        parse(jsonStr)
+      }.getOrElse(null)
+
+      if (jObj == null) Nil else {
+
+        val cal = Calendar.getInstance()
+        val currDate = new SimpleDateFormat("yyyy-MM-dd hh:mm:ss.SSS").format(new Date(cal.getTimeInMillis))
+        val npiStatusEffDte = getJSONValue[String](jObj, "payload.agencyIdentifiers.npi.status.effectiveDateTime")
+        val npiStatusExpDte = getJSONValue[String](jObj, "payload.agencyIdentifiers.npi.status.expirationDateTime")
+
+        def getNpiVal(jVal: JValue): String = {
+          val npi = {
+            if ((npiStatusEffDte.ne(null)) && (npiStatusExpDte.ne(null))) {
+              if ((npiStatusEffDte <= currDate) && (npiStatusExpDte > currDate)) {
+                getJSONValue[String](jObj, "payload.agencyIdentifiers.npi.value")
+              }
+              else null
+            }
+            else if (npiStatusEffDte.ne(null)) {
+              if (npiStatusEffDte <= currDate) {
+                getJSONValue[String](jObj, "payload.agencyIdentifiers.npi.value")
+              }
+              else null
+            }
+            else null
+          }
+          npi
+        }
+
+        val npi = getNpiVal(jObj)
+
+        val tenantId = {
+          if (getJSONValue[BigInt](jObj, "payload.tenantId").eq(null)) 0L
+          else getJSONValue[BigInt](jObj, "payload.tenantId").toLong
+        }
+        val doingBusiness = {
+          val dbList = getJSONValue[List[JValue]](jObj, "payload.name.doingBusinessAs")
+          if (dbList.eq(null)) Array(): Array[String] else dbList.map(x => getVal[String](x)).toArray
+        }
+
+        val formerLegal = {
+          val flList = getJSONValue[List[JValue]](jObj, "payload.name.formerLegal")
+          if (flList.eq(null)) Array(): Array[String] else flList.map(x => getVal[String](x)).toArray
+        }
+        val alternatives = {
+          val alterList = getJSONValue[List[JValue]](jObj, "payload.name.alternatives")
+          if (alterList.eq(null)) Array(): Array[String] else alterList.map(x => getVal[String](x)).toArray
+        }
+
+        val configMap = provOrgMapping.map(x => (x._1, getJSONValue[String](jObj, x._2)))
+
+
+        try {
+          configMap.map(_._2) ::: List(npi, tenantId, doingBusiness, formerLegal, alternatives) :::
+            List(getStoreKeyList(jObj, "payload.")) :::
+            List(getTaxonomyList(jObj), getEmailList(jObj), getPhoneNumList(jObj)) :::
+            List(getPostalAddrList(jObj), getDeasList(jObj)) :::
+            List(getMedicaidList(jObj), getNpiList(jObj), getSpiList(jObj))
+        }
+        catch {
+          case e: Exception => e.printStackTrace();
+            print(e)
+            sys.exit(1)
+            List()
+        }
+      }
+    }
+    )
+    val one2OneCols = provOrgMapping.map(_._1)
+    val selCols = (one2OneCols :+ "npi_nbr" :+ "tenant_id" :+ "doing_business_as_nmes" :+ "former_legal_nmes" :+
+      "alternative_nmes" :+ "provider_organization_store_key" :+ "provider_organization_taxonomy" :+
+      "provider_organization_email_address" :+ "provider_organization_phone" :+
+      "provider_organization_postal_address" :+
+      "provider_organization_dea_id" :+ "provider_organization_medicaid_id" :+
+      "provider_organization_npi" :+ "provider_organization_spi")
+    val dfSchema = StructType(
+      one2OneCols.map(x => StructField(x, StringType)) :+
+        StructField("npi_nbr", StringType) :+
+        StructField("tenant_id", LongType) :+
+        StructField("doing_business_as_nmes", ArrayType(StringType)) :+
+        StructField("former_legal_nmes", ArrayType(StringType)) :+
+        StructField("alternative_nmes", ArrayType(StringType)) :+
+        StructField("provider_organization_store_key", getStoreKeySchema) :+
+        StructField("provider_organization_taxonomy", getTaxonomySchema) :+
+        StructField("provider_organization_email_address", getEmailAddrSchema) :+
+        StructField("provider_organization_phone", getPhoneSchema) :+
+        StructField("provider_organization_postal_address", getPostalAddressSchema) :+
+        StructField("provider_organization_dea_id", getDeaIdSchema) :+
+        StructField("provider_organization_medicaid_id", getMedicaidSchema) :+
+        StructField("provider_organization_npi", getNpiSchema) :+
+        StructField("provider_organization_spi", getSpiSchema)
+    )
+    val rowRdd = colsRdd.filter(_.nonEmpty).map(Row.fromSeq)
+    val df = spark.createDataFrame(rowRdd, dfSchema).selectExpr(selCols: _*)
+    val transformedDf = df.
+      withColumn("data_lake_last_update_tms", current_timestamp)
+    transformedDf
+
+  }
+
+  def getStoreKeyList(jVal: JValue, sourceStr: String = ""): List[Row] = {
+    val (pkeyName, skeyName) = (s"$sourceStr" + "storeKeySet.primaryKey", s"$sourceStr" + "storeKeySet.secondaryKeys")
+    val (pkList, skList) = (getJSONValue[List[JObject]](jVal, pkeyName), getJSONValue[List[JObject]](jVal, skeyName))
+    val primaryStoreInd = pkList != null
+    val secStoreInd = skList != null
+    val pkCheck = if (primaryStoreInd) {
+      val pk = List(loop(jVal, pkeyName.split("\\.")).asInstanceOf[JObject])
+      getStoreKeyVal(pk, true)
+    } else List(): List[Row]
+    val skCheck = if (secStoreInd) {
+      getStoreKeyVal(skList, false)
+    } else List(): List[Row]
+    pkCheck ::: skCheck
+  }
+
+  def getStoreKeyVal(list: List[JObject], storeInd: Boolean): List[Row] = {
+    val kc = List(("", ""))
+    if (list == null) List(): List[Row]
+    else list.map(x => {
+      (
+        getJSONValue[String](x, "storeName"),
+        getJSONValue[String](x, "keyName"),
+        storeInd,
+        if (getJSONValue[List[JObject]](x, "keyComponents").eq(null)) kc
+        else (getJSONValue[List[JObject]](x, "keyComponents").
+          map(x => (getJSONValue[String](x, "name"), getJSONValue[String](x, "value")))),
+        getJSONValue[String](x, "status.value"),
+        getTimeStamp(getJSONValue[String](x, "status.effectiveDateTime")),
+        getJSONValue[String](x, "status.effectiveDateTime"),
+        if (getJSONValue[String](x, "status.effectiveDateTime").eq(null)) null
+        else entityTimeZone,
+        getTimeStamp(getJSONValue[String](x, "status.expirationDateTime")),
+        getJSONValue[String](x, "status.expirationDateTime"),
+        if (getJSONValue[String](x, "status.expirationDateTime").eq(null)) null
+        else entityTimeZone
+      )
+    }).flatMap {
+      case (b, c, d, e, f, g, h, i, j, k, l) => e.map(v => Row.fromSeq(Seq(b, c, d, v._1, v._2, f, g, h, i, j, k, l)))
+    }
+  }
+
+  def getTaxList(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "code"),
+      getJSONValue[String](jVal, "relativeId"),
+      getJSONValue[Boolean](jVal, "primaryIndicator"),
+      getJSONValue[String](jVal, "taxonomyType"),
+      getJSONValue[String](jVal, "specialization"),
+      getJSONValue[String](jVal, "category"),
+      getJSONValue[String](jVal, "sourcedFrom.sourceName"),
+      getJSONValue[String](jVal, "sourcedFrom.sourceType"),
+      getJSONValue[String](jVal, "sourcedFrom.method"),
+      getTimeStamp(getJSONValue[String](jVal, "sourcedFrom.updatedDateTime")),
+      getJSONValue[String](jVal, "sourcedFrom.updatedDateTime"),
+      if (getJSONValue[String](jVal, "sourcedFrom.updatedDateTime").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "status.value"),
+      getTimeStamp(getJSONValue[String](jVal, "status.effectiveDateTime")),
+      getJSONValue[String](jVal, "status.effectiveDateTime"),
+      if (getJSONValue[String](jVal, "status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "status.expirationDateTime")),
+      getJSONValue[String](jVal, "status.expirationDateTime"),
+      if (getJSONValue[String](jVal, "status.expirationDateTime").eq(null)) null
+      else entityTimeZone
+    ))
+  }
+
+  def getDeaAuthorizationsVal(list: List[JObject]): List[Row] = {
+    if (list == null) List(): List[Row]
+    else list.map(x => Row.fromSeq(Seq(
+      getJSONValue[Boolean](x, "schedule1"),
+      getJSONValue[Boolean](x, "schedule2"),
+      getJSONValue[Boolean](x, "schedule2N"),
+      getJSONValue[Boolean](x, "schedule3"),
+      getJSONValue[Boolean](x, "schedule3N"),
+      getJSONValue[Boolean](x, "schedule4"),
+      getJSONValue[Boolean](x, "schedule5"),
+      getJSONValue[Boolean](x, "list"),
+      getJSONValue[String](x, "status.value"),
+      getTimeStamp(getJSONValue[String](x, "status.effectiveDateTime")),
+      getJSONValue[String](x, "status.effectiveDateTime"),
+      if (getJSONValue[String](x, "status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "status.expirationDateTime")),
+      getJSONValue[String](x, "status.expirationDateTime"),
+      if (getJSONValue[String](x, "status.expirationDateTime").eq(null)) null
+      else entityTimeZone
+    )))
+  }
+
+  def getDeaAuthorizationsList(jVal: JValue): List[Row] = {
+    val deaList = getJSONValue[List[JObject]](jVal, "deaAuthorizations")
+    getDeaAuthorizationsVal(deaList)
+  }
+
+
+  def getDeaEffectivity(jVal: JValue): List[Row] = {
+    val deaEffList = getJSONValue[List[JObject]](jVal, "effectivityPeriods")
+    if (deaEffList == null) List(): List[Row]
+    else deaEffList.map(x => Row.fromSeq(Seq(
+      getJSONValue[String](x, "start"),
+      getJSONValue[String](x, "end"),
+      getJSONValue[String](x, "received"),
+      getJSONValue[String](x, "ceased"),
+      getTimeStamp(getJSONValue[String](x, "start")),
+      if (getJSONValue[String](x, "start").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "end")),
+      if (getJSONValue[String](x, "end").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "received")),
+      if (getJSONValue[String](x, "received").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "ceased")),
+      if (getJSONValue[String](x, "ceased").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](x, "ceasedCode.value"),
+      getJSONValue[String](x, "ceasedCode.description")
+    )))
+  }
+
+  def getDeas(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "value"),
+      getJSONValue[String](jVal, "issuingLocation"),
+      getJSONValue[String](jVal, "issuingState.code"),
+      getJSONValue[String](jVal, "issuingAddress"),
+      getJSONValue[String](jVal, "issuingAgency"),
+      getJSONValue[String](jVal, "issuingState.name"),
+      getJSONValue[String](jVal, "issuingState.description"),
+      getJSONValue[String](jVal, "status.value"),
+      getTimeStamp(getJSONValue[String](jVal, "status.effectiveDateTime")),
+      getJSONValue[String](jVal, "status.effectiveDateTime"),
+      if (getJSONValue[String](jVal, "status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "status.expirationDateTime")),
+      getJSONValue[String](jVal, "status.expirationDateTime"),
+      if (getJSONValue[String](jVal, "status.expirationDateTime").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "businessActivity.code"),
+      getJSONValue[String](jVal, "businessActivity.subcode"),
+      getJSONValue[String](jVal, "businessActivity.subtypeDescription"),
+      getDeaAuthorizationsList(jVal),
+      getDeaEffectivity(jVal)
+    ))
+  }
+
+  def getMedEffectivity(jVal: JValue): List[Row] = {
+    val medEffList = getJSONValue[List[JObject]](jVal, "effectivityPeriods")
+    if (medEffList == null) List(): List[Row]
+    else medEffList.map(x => Row.fromSeq(Seq(
+      getJSONValue[String](x, "value"),
+      getJSONValue[String](x, "issuingState.code"),
+      getJSONValue[String](x, "start"),
+      getJSONValue[String](x, "end"),
+      getJSONValue[String](x, "received"),
+      getJSONValue[String](x, "ceased"),
+      getTimeStamp(getJSONValue[String](x, "start")),
+      if (getJSONValue[String](x, "start").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "end")),
+      if (getJSONValue[String](x, "end").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "received")),
+      if (getJSONValue[String](x, "received").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "ceased")),
+      if (getJSONValue[String](x, "ceased").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](x, "ceasedCode.value"),
+      getJSONValue[String](x, "ceasedCode.description")
+    )))
+  }
+
+  def getMedicaid(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "value"),
+      getJSONValue[String](jVal, "issuingState.code"),
+      getJSONValue[String](jVal, "issuingLocation"),
+      getJSONValue[String](jVal, "issuingAgency"),
+      getJSONValue[String](jVal, "issuingState.name"),
+      getJSONValue[String](jVal, "issuingState.description"),
+      getJSONValue[String](jVal, "status.value"),
+      getTimeStamp(getJSONValue[String](jVal, "status.effectiveDateTime")),
+      getJSONValue[String](jVal, "status.effectiveDateTime"),
+      if (getJSONValue[String](jVal, "status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "status.expirationDateTime")),
+      getJSONValue[String](jVal, "status.expirationDateTime"),
+      if (getJSONValue[String](jVal, "status.expirationDateTime").eq(null)) null
+      else entityTimeZone,
+      getMedEffectivity(jVal)
+    ))
+  }
+
+  def getPostAddr(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "relativeId"),
+      getJSONValue[String](jVal, "relativeId"),
+      getJSONValue[String](jVal, "contactUsageType"),
+      if (getJSONValue[List[JValue]](jVal, "streetAddress").eq(null)) null
+      else getJSONValue[List[JValue]](jVal, "streetAddress").
+        map(x => getVal[String](x)).filterNot(_ == null),
+      getJSONValue[String](jVal, "apartmentNumber"),
+      getJSONValue[String](jVal, "officeSuite"),
+      getJSONValue[String](jVal, "postOfficeBoxNumber"),
+      getJSONValue[String](jVal, "postalCode"),
+      getJSONValue[String](jVal, "city"),
+      getJSONValue[String](jVal, "state.code"),
+      getJSONValue[String](jVal, "state.name"),
+      getJSONValue[String](jVal, "state.description"),
+      getJSONValue[String](jVal, "country.iso2Code"),
+      getJSONValue[String](jVal, "country.iso3Code"),
+      getJSONValue[String](jVal, "country.name"),
+      getJSONValue[String](jVal, "country.description"),
+      getJSONValue[Boolean](jVal, "standardizedIndicator"),
+      if (getJSONValue[List[JValue]](jVal, "providedAddress.streetAddress").eq(null)) null
+      else getJSONValue[List[JValue]](jVal, "providedAddress.streetAddress").
+        map(x => getVal[String](x)).filterNot(_ == null),
+      getJSONValue[String](jVal, "providedAddress.city"),
+      getJSONValue[String](jVal, "providedAddress.postalCode"),
+      getJSONValue[String](jVal, "providedAddress.state.code"),
+      getJSONValue[String](jVal, "providedAddress.country.name"),
+      getJSONValue[String](jVal, "sourcedFrom.sourceName"),
+      getJSONValue[String](jVal, "sourcedFrom.sourceType"),
+      getJSONValue[String](jVal, "sourcedFrom.method"),
+      getTimeStamp(getJSONValue[String](jVal, "sourcedFrom.updatedDateTime")),
+      getJSONValue[String](jVal, "status.value"),
+      getTimeStamp(getJSONValue[String](jVal, "status.effectiveDateTime")),
+      getJSONValue[String](jVal, "status.effectiveDateTime"),
+      if (getJSONValue[String](jVal, "status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "status.expirationDateTime")),
+      getJSONValue[String](jVal, "status.expirationDateTime"),
+      if (getJSONValue[String](jVal, "status.expirationDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "temporary.effectiveDate")),
+      getJSONValue[String](jVal, "temporary.effectiveDate"),
+      if (getJSONValue[String](jVal, "temporary.effectiveDate").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "temporary.expirationDate")),
+      getJSONValue[String](jVal, "temporary.expirationDate"),
+      if (getJSONValue[String](jVal, "temporary.expirationDate").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "temporary.note"),
+      getJSONValue[Boolean](jVal, "unreachable.indicator"),
+      getTimeStamp(getJSONValue[String](jVal, "unreachable.effectiveDate")),
+      getJSONValue[String](jVal, "unreachable.effectiveDate"),
+      if (getJSONValue[String](jVal, "unreachable.effectiveDate").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "unreachable.note"),
+      getJSONValue[Boolean](jVal, "unverified.indicator"),
+      getTimeStamp(getJSONValue[String](jVal, "unverified.effectiveDate")),
+      getJSONValue[String](jVal, "unverified.effectiveDate"),
+      if (getJSONValue[String](jVal, "unverified.effectiveDate").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "unverified.note"),
+      getJSONValue[String](jVal, "uspsAddressType")
+    ))
+  }
+
+  def getNpi(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, s"${parentKey}value"),
+      getJSONValue[String](jVal, s"${parentKey}issuingState.code"),
+      getJSONValue[String](jVal, s"${parentKey}issuingLocation"),
+      getJSONValue[String](jVal, s"${parentKey}issuingAgency"),
+      getJSONValue[String](jVal, s"${parentKey}issuingState.name"),
+      getJSONValue[String](jVal, s"${parentKey}issuingState.description"),
+      getJSONValue[String](jVal, s"${parentKey}status.value"),
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}status.effectiveDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}status.effectiveDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}status.expirationDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}status.expirationDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}status.expirationDateTime").eq(null)) null
+      else entityTimeZone,
+      getNpiEffectivity(jVal, parentKey)
+    ))
+  }
+
+  def getNpiEffectivity(jVal: JValue, parentKey: String): List[Row] = {
+    val npiEffList = getJSONValue[List[JObject]](jVal, s"${parentKey}effectivityPeriods")
+    if (npiEffList == null) List(): List[Row]
+    else npiEffList.map(x => if (x == null) null else getNpiEffectivityVal(x, ""))
+  }
+
+  def getNpiEffectivityVal(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "start"),
+      getJSONValue[String](jVal, "end"),
+      getJSONValue[String](jVal, "received"),
+      getJSONValue[String](jVal, "ceased"),
+      getTimeStamp(getJSONValue[String](jVal, "start")),
+      if (getJSONValue[String](jVal, "start").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "end")),
+      if (getJSONValue[String](jVal, "end").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "received")),
+      if (getJSONValue[String](jVal, "received").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "ceased")),
+      if (getJSONValue[String](jVal, "ceased").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "ceasedCode.value"),
+      getJSONValue[String](jVal, "ceasedCode.description")
+    ))
+  }
+
+  def getSpi(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, s"${parentKey}value"),
+      getJSONValue[String](jVal, s"${parentKey}issuingState.code"),
+      getJSONValue[String](jVal, s"${parentKey}issuingLocation"),
+      getJSONValue[String](jVal, s"${parentKey}issuingAgency"),
+      getJSONValue[String](jVal, s"${parentKey}issuingState.name"),
+      getJSONValue[String](jVal, s"${parentKey}issuingState.description"),
+      getJSONValue[String](jVal, s"${parentKey}status.value"),
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}status.effectiveDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}status.effectiveDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, s"${parentKey}status.expirationDateTime")),
+      getJSONValue[String](jVal, s"${parentKey}status.expirationDateTime"),
+      if (getJSONValue[String](jVal, s"${parentKey}status.expirationDateTime").eq(null)) null
+      else entityTimeZone,
+      getSpiEffectivity(jVal, parentKey)
+    ))
+  }
+
+  def getSpiEffectivity(jVal: JValue, parentKey: String): List[Row] = {
+    val spiEffList = getJSONValue[List[JObject]](jVal, s"${parentKey}effectivityPeriods")
+    if (spiEffList == null) List(): List[Row]
+    else spiEffList.map(x => if (x == null) null else getSpiEffectivityVal(x, ""))
+  }
+
+  def getSpiEffectivityVal(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "start"),
+      getJSONValue[String](jVal, "end"),
+      getJSONValue[String](jVal, "received"),
+      getJSONValue[String](jVal, "ceased"),
+      getTimeStamp(getJSONValue[String](jVal, "start")),
+      if (getJSONValue[String](jVal, "start").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "end")),
+      if (getJSONValue[String](jVal, "end").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "received")),
+      if (getJSONValue[String](jVal, "received").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "ceased")),
+      if (getJSONValue[String](jVal, "ceased").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "ceasedCode.value"),
+      getJSONValue[String](jVal, "ceasedCode.description")
+    ))
+  }
+
+  def getEmailAddr(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "address"),
+      getJSONValue[String](jVal, "relativeId"),
+      getJSONValue[String](jVal, "status.value"),
+      getTimeStamp(getJSONValue[String](jVal, "status.effectiveDateTime")),
+      getJSONValue[String](jVal, "status.effectiveDateTime"),
+      if (getJSONValue[String](jVal, "status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "status.expirationDateTime")),
+      getJSONValue[String](jVal, "status.expirationDateTime"),
+      if (getJSONValue[String](jVal, "status.expirationDateTime").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "sourcedFrom.sourceName"),
+      getJSONValue[String](jVal, "sourcedFrom.sourceType"),
+      getJSONValue[String](jVal, "sourcedFrom.method"),
+      getTimeStamp(getJSONValue[String](jVal, "sourcedFrom.updatedDateTime")),
+      getJSONValue[String](jVal, "sourcedFrom.updatedDateTime"),
+      if (getJSONValue[String](jVal, "sourcedFrom.updatedDateTime").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[Boolean](jVal, "unreachable.indicator"),
+      getTimeStamp(getJSONValue[String](jVal, "unreachable.effectiveDate")),
+      getJSONValue[String](jVal, "unreachable.effectiveDate"),
+      if (getJSONValue[String](jVal, "unreachable.effectiveDate").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "unreachable.note"),
+      getJSONValue[String](jVal, "unverified.indicator"),
+      getTimeStamp(getJSONValue[String](jVal, "unverified.effectiveDate")),
+      getJSONValue[String](jVal, "unverified.effectiveDate"),
+      if (getJSONValue[String](jVal, "unverified.effectiveDate").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "unverified.note")
+    ))
+  }
+
+  def getPhEffectivity(jVal: JValue): List[Row] = {
+    val phEffList = getJSONValue[List[JObject]](jVal, "effectivityPeriod")
+    if (phEffList == null) List(): List[Row]
+    else phEffList.map(x => Row.fromSeq(Seq(
+      getJSONValue[String](x, "start"),
+      getJSONValue[String](x, "end"),
+      getJSONValue[String](x, "received"),
+      getJSONValue[String](x, "ceased"),
+      getTimeStamp(getJSONValue[String](x, "start")),
+      if (getJSONValue[String](x, "start").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "end")),
+      if (getJSONValue[String](x, "end").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "received")),
+      if (getJSONValue[String](x, "received").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](x, "ceased")),
+      if (getJSONValue[String](x, "ceased").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](x, "ceasedCode")
+    )))
+  }
+
+  def getPhConf(jVal: JValue): List[Row] = {
+    val phConfList = getJSONValue[List[JObject]](jVal, "confirmed")
+    if (phConfList == null) List(): List[Row]
+    else phConfList.map(x => Row.fromSeq(Seq(
+      getJSONValue[String](x, "confirmed"),
+      getJSONValue[String](x, "associatedAddress"),
+      getJSONValue[Boolean](x, "indicator"),
+      getJSONValue[String](x, "verificationRationale"),
+      getPhEffectivity(x)
+    )))
+  }
+
+  def getPhNum(jVal: JValue, parentKey: String): Row = {
+    Row.fromSeq(Seq(
+      getJSONValue[String](jVal, "relativeId"),
+      getJSONValue[String](jVal, "relativeId"),
+      getJSONValue[String](jVal, "providedPhoneNumber"),
+      getJSONValue[String](jVal, "contactUsageType"),
+      getJSONValue[String](jVal, "countryCallingCode"),
+      getJSONValue[String](jVal, "number"),
+      getJSONValue[String](jVal, "extension"),
+      getJSONValue[Boolean](jVal, "capabilities.fax"),
+      getJSONValue[Boolean](jVal, "capabilities.voice"),
+      getJSONValue[Boolean](jVal, "capabilities.text"),
+      getJSONValue[String](jVal, "status.value"),
+      getTimeStamp(getJSONValue[String](jVal, "status.effectiveDateTime")),
+      getJSONValue[String](jVal, "status.effectiveDateTime"),
+      if (getJSONValue[String](jVal, "status.effectiveDateTime").eq(null)) null
+      else entityTimeZone,
+      getTimeStamp(getJSONValue[String](jVal, "status.expirationDateTime")),
+      getJSONValue[String](jVal, "status.expirationDateTime"),
+      if (getJSONValue[String](jVal, "status.expirationDateTime").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "sourcedFrom.sourceName"),
+      getJSONValue[String](jVal, "sourcedFrom.sourceType"),
+      getJSONValue[String](jVal, "sourcedFrom.method"),
+      getTimeStamp(getJSONValue[String](jVal, "sourcedFrom.updatedDateTime")),
+      getJSONValue[String](jVal, "sourcedFrom.updatedDateTime"),
+      if (getJSONValue[String](jVal, "sourcedFrom.updatedDateTime").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[Boolean](jVal, "standardizedIndicator"),
+      getJSONValue[Boolean](jVal, "unreachable.indicator"),
+      getTimeStamp(getJSONValue[String](jVal, "unreachable.effectiveDate")),
+      getJSONValue[String](jVal, "unreachable.effectiveDate"),
+      if (getJSONValue[String](jVal, "unreachable.effectiveDate").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "unreachable.note"),
+      getJSONValue[Boolean](jVal, "unverified.indicator"),
+      getTimeStamp(getJSONValue[String](jVal, "unverified.effectiveDate")),
+      getJSONValue[String](jVal, "unverified.effectiveDate"),
+      if (getJSONValue[String](jVal, "unverified.effectiveDate").eq(null)) null
+      else entityTimeZone,
+      getJSONValue[String](jVal, "unverified.note"),
+      {
+        val associateAddrList = getJSONValue[List[JValue]](jVal, "associatedAddresses")
+        if (associateAddrList.eq(null)) null else associateAddrList.map(x => getVal[String](x)).filterNot(_ == null)
+      },
+      getPhConf(jVal)
+    ))
+  }
+
+  def getTaxonomyList(jVal: JValue): Array[Row] = {
+    val taxonomyList = getJSONValue[List[JObject]](jVal, "payload.taxonomyCodes")
+    if (taxonomyList == null) Array() else {
+      taxonomyList.map(p => if (p == null) null else getTaxList(p, "")).toArray
+    }
+  }
+
+  def getPostalAddrList(jVal: JValue): Array[Row] = {
+    val postalAddrList = getJSONValue[List[JObject]](jVal, "payload.postalAddresses")
+    if (postalAddrList == null) Array() else {
+      postalAddrList.map(p => if (p == null) null else getPostAddr(p, "")).toArray
+    }
+  }
+
+  def getPhoneNumList(jVal: JValue): Array[Row] = {
+    val phList = getJSONValue[List[JObject]](jVal, "payload.phoneNumbers")
+    if (phList == null) Array() else {
+      phList.map(p => if (p == null) null else getPhNum(p, "")).toArray
+    }
+  }
+
+  def getDeasList(jVal: JValue): Array[Row] = {
+    val deasList = getJSONValue[List[JObject]](jVal, "payload.agencyIdentifiers.deas")
+    if (deasList == null) Array() else deasList.map(p => if (p == null) null else getDeas(p, "")).toArray
+  }
+
+  def getEmailList(jVal: JValue): Array[Row] = {
+    val emailList = getJSONValue[List[JObject]](jVal, "payload.emailAddresses")
+    if (emailList == null) Array() else {
+      emailList.map(x => if (x == null) null else getEmailAddr(x, "")).toArray
+    }
+  }
+
+  def getMedicaidList(jVal: JValue): Array[Row] = {
+    val medList = getJSONValue[List[JObject]](jVal, "payload.agencyIdentifiers.medicaidIdentifiers")
+    if (medList == null) Array() else medList.map(x => if (x == null) null else getMedicaid(x, "")).toArray
+  }
+
+  def getNpiList(jVal: JValue): Array[Row] = {
+    val npiList = getJSONValue[List[JObject]](jVal, "payload.agencyIdentifiers.npi")
+    if (npiList == null) Array() else Array(getNpi(jVal, "payload.agencyIdentifiers.npi."))
+  }
+
+  def getSpiList(jVal: JValue): Array[Row] = {
+    val spiList = getJSONValue[List[JObject]](jVal, "payload.agencyIdentifiers.spi")
+    if (spiList == null) Array() else Array(getSpi(jVal, "payload.agencyIdentifiers.spi."))
+  }
+
+  override def save(df: DataFrame, spark: SparkSession, hbaseCtx: HBaseContext, config: Config): (Long, String)
+
+  = null
+
+}
